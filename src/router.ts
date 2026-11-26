@@ -1,4 +1,4 @@
-import type { TgUpdate } from "./telegram-client.ts";
+import type { TgMessage, TgUpdate } from "./telegram-client.ts";
 import { blocksToPlainText } from "./rich-blocks.ts";
 
 /** Compact callback_data builders — every value ≤ 64 bytes (Telegram limit). */
@@ -41,6 +41,17 @@ export type TgAction =
   | { kind: "kill"; chatId: number; yes: boolean; nonce?: string }
   | { kind: "clear"; chatId: number; doIt: boolean; nonce?: string }
   | { kind: "prompt"; chatId: number; text: string }
+  /** Media patch: an incoming file (photo/document/video/audio/voice) from
+    * the owner. The bridge downloads it and injects a prompt with its path. */
+  | {
+      kind: "media";
+      chatId: number;
+      messageId: number;
+      mediaKind: "photo" | "document" | "video" | "audio" | "voice";
+      fileId: string;
+      fileName?: string;
+      caption?: string;
+    }
   | { kind: "dialogAnswer"; chatId: number; dialogId: number; index: number }
   | { kind: "dialogCancel"; chatId: number; dialogId: number }
   | { kind: "dialogText"; chatId: number; replyToMessageId: number; text: string }
@@ -70,6 +81,16 @@ const CMD_RE = /^\/([a-zA-Z0-9_][a-zA-Z0-9_:.-]*)(?:@[a-zA-Z0-9_]+)?\s*(.*)$/;
  * so text the user sends from inline mode arrives with the prefix — the
  * `^/`-anchored command regex must not see it as plain text.
  */
+/** Media patch: first file-carrying part of an incoming message. */
+function pickMedia(msg: TgMessage): { kind: "photo" | "document" | "video" | "audio" | "voice"; fileId: string; fileName?: string } | undefined {
+  if (msg.photo?.[0]?.file_id) return { kind: "photo", fileId: msg.photo[0].file_id };
+  if (msg.document?.file_id) return { kind: "document", fileId: msg.document.file_id, fileName: msg.document.file_name };
+  if (msg.video?.file_id) return { kind: "video", fileId: msg.video.file_id, fileName: msg.video.file_name };
+  if (msg.audio?.file_id) return { kind: "audio", fileId: msg.audio.file_id, fileName: msg.audio.file_name };
+  if (msg.voice?.file_id) return { kind: "voice", fileId: msg.voice.file_id };
+  return undefined;
+}
+
 function stripBotMention(text: string, botUsername: string | undefined): string {
   if (!botUsername) return text;
   const escaped = botUsername.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -168,18 +189,34 @@ export function route(
   // `rich_message` blocks and NO `text` — project to plain text so it routes
   // like text instead of being silently ignored. `text` wins if both present.
   const rawText = msg.text ?? (msg.rich_message ? blocksToPlainText(msg.rich_message.blocks) : undefined);
-  if (!rawText) return { kind: "ignore" }; // non-text (photo, …), empty
+  const media = pickMedia(msg); // media patch
+  if (!rawText && !media) return { kind: "ignore" }; // non-text (photo, …), empty
   const chatId = msg.chat.id;
   const fromId = msg.from?.id ?? -1;
   if (msg.from?.is_bot) return { kind: "ignore" };
 
   if (ownerId === undefined) {
-    const t = rawText.trim();
+    const t = (rawText ?? "").trim();
     if (t === "/start" || t.startsWith("/start@")) return { kind: "pair", chatId, fromId };
     return { kind: "notAuthorized", chatId, fromId };
   }
   if (fromId !== ownerId) return { kind: "notAuthorized", chatId, fromId };
 
+  // Media patch: an owner file (any media kind) downloads + prompts, even
+  // when it also carries a caption/text (that becomes the prompt body).
+  if (media) {
+    return {
+      kind: "media",
+      chatId,
+      messageId: msg.message_id,
+      mediaKind: media.kind,
+      fileId: media.fileId,
+      fileName: media.fileName,
+      caption: msg.caption ?? rawText,
+    };
+  }
+
+  if (!rawText) return { kind: "ignore" }; // narrowing: media-only was returned above
   const text = stripBotMention(rawText.trim(), opts?.botUsername);
   // A reply to a pending dialog message is the dialog's text answer — even when
   // it looks like a command (the owner is answering, not commanding).

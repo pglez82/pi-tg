@@ -20,6 +20,10 @@ import { PendingDialogs } from "./src/ui-dialogs.ts";
 import { runTgCompaction } from "./src/compact.ts";
 import { mergeCommands, filterCommands, customCommandMatch, toInlineResults, toCustomResult, isListable, dispatchFor, actionForDecision } from "./src/pi-commands.ts";
 import type { TgInlineQuery } from "./src/telegram-client.ts";
+import type { TgAction } from "./src/router.ts";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join, basename } from "node:path";
+import { homedir } from "node:os";
 
 // pi's agent dir honors PI_CODING_AGENT_DIR (tests point it at a temp dir).
 const CFG = { agentDir: getAgentDir() };
@@ -318,9 +322,48 @@ export default function piTelegram(pi: ExtensionAPI): void {
       await bridge.dispatch(action);
       return;
     }
+    if (action.kind === "media") { // media patch: download + inject path as prompt
+      await handleMedia(action);
+      return;
+    }
     const encoded = encodeInternal(action);
     if (encoded === null) return;
     pi.sendUserMessage(`/tg ${encoded}`, { expandPromptTemplates: true });
+  }
+
+  /**
+   * Media patch: download an owner file to the local inbox and inject its
+   * path into the session as a plain prompt (reusing the full prompt
+   * pipeline: drafts, busy-queue, compaction gates).
+   */
+  async function handleMedia(action: Extract<TgAction, { kind: "media" }>): Promise<void> {
+    if (!client || !out || !bridge) return;
+    const inbox = join(homedir(), ".pi", "agent", "pi-telegram", "inbox");
+    const label =
+      action.mediaKind === "photo" ? "📷 photo" : action.mediaKind === "voice" ? "🎤 voice" : action.mediaKind;
+    await out.send(action.chatId, `⬇️ ${label} — downloading…`);
+    try {
+      const buf = await client.downloadFile(action.fileId);
+      mkdirSync(inbox, { recursive: true });
+      let name = (action.fileName ?? `tg-${action.messageId}`).replace(/[^\w.\- ()\u00C0-\u024F]/g, "_").trim();
+      if (name.length > 120) name = name.slice(0, 120);
+      if (!name) name = `tg-${action.messageId}`;
+      const dest = join(inbox, `${action.messageId}_${name}`);
+      writeFileSync(dest, buf);
+      const text =
+        `[Archivo recibido de Telegram (${action.mediaKind}): ${dest}] (${(buf.length / 1024).toFixed(1)} KB)` +
+        (action.caption ? `\n${action.caption}` : "");
+      await bridge.dispatch({ kind: "prompt", chatId: action.chatId, text });
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err);
+      await out
+        .send(
+          action.chatId,
+          `⚠️ Couldn't receive the file: ${why}${action.mediaKind !== "voice" ? " (Bot API bots download up to 20 MB)" : ""}`,
+          { parseMode: null }
+        )
+        .catch(() => {});
+    }
   }
 
   /**

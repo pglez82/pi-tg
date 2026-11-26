@@ -59,6 +59,13 @@ export interface TgMessage {
    * forwarded rich message) carries blocks and NO `text` field. */
   rich_message?: InputRichMessage;
   reply_to_message?: { message_id: number };
+  /** Media (pi-tg-media patch): file-carrying message parts. */
+  caption?: string;
+  photo?: Array<{ file_id: string; file_unique_id?: string; width?: number; height?: number; file_size?: number }>;
+  document?: { file_id: string; file_unique_id?: string; file_name?: string; mime_type?: string; file_size?: number };
+  video?: { file_id: string; file_unique_id?: string; file_name?: string; file_size?: number };
+  audio?: { file_id: string; file_unique_id?: string; file_name?: string; file_size?: number };
+  voice?: { file_id: string; file_unique_id?: string; file_size?: number };
 }
 
 export interface TgCallbackQuery {
@@ -277,6 +284,26 @@ export class TelegramClient {
 
   getMe(): Promise<TgBotMe> {
     return this.call("getMe") as Promise<TgBotMe>;
+  }
+
+  /** Media patch: resolve a file_id to its Bot API download path (bots: ≤ 20 MB). */
+  getFile(fileId: string): Promise<{ file_id: string; file_unique_id?: string; file_size?: number; file_path?: string }> {
+    return this.call("getFile", { file_id: fileId }) as Promise<{ file_id: string; file_unique_id?: string; file_size?: number; file_path?: string }>;
+  }
+
+  /** Media patch: download a Bot API file's bytes. */
+  async downloadFile(fileId: string, opts?: { signal?: AbortSignal }): Promise<Buffer> {
+    const f = await this.getFile(fileId);
+    if (!f.file_path) throw new TgError("getFile", 0, "no file_path in getFile result");
+    const url = `https://api.telegram.org/file/bot${this.token}/${f.file_path}`;
+    let res: Response;
+    try {
+      res = await this.fetchImpl(url, { method: "GET", signal: opts?.signal });
+    } catch (err) {
+      throw new TgNetworkError("getFile", err);
+    }
+    if (!res.ok) throw new TgNetworkError("getFile", new Error(`HTTP ${res.status} downloading file`));
+    return Buffer.from(await res.arrayBuffer());
   }
 
   /** Set the global bot menu (idempotent; the caller treats this best-effort). */
